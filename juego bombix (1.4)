@@ -1,0 +1,805 @@
+# -*- coding: utf-8 -*-
+import math
+import random
+import sys
+import pygame
+
+# ---------------------------------------------------------------- CONFIG
+pygame.mixer.pre_init(frequency=22050, size=-16, channels=1, buffer=512)
+pygame.init()
+
+TILE = 40
+COLS, ROWS = 15, 11
+HUD_H = 56
+WIDTH = COLS * TILE
+HEIGHT = ROWS * TILE + HUD_H
+PLAY_H = ROWS * TILE
+
+FULLSCREEN = True   # Empieza en pantalla completa. Pon False para empezar en ventana.
+
+
+def create_screen(fullscreen=False):
+    flags = pygame.SCALED
+    if fullscreen:
+        flags |= pygame.FULLSCREEN
+    return pygame.display.set_mode((WIDTH, HEIGHT), flags)
+
+
+screen = create_screen(FULLSCREEN)
+pygame.display.set_caption("BOMBIX")
+pygame.mouse.set_visible(False)
+clock = pygame.time.Clock()
+
+F_BIG = pygame.font.SysFont("consolas", 46, bold=True)
+F_MED = pygame.font.SysFont("consolas", 26, bold=True)
+F_SM  = pygame.font.SysFont("consolas", 17, bold=True)
+
+# ---------------------------------------------------------------- COLORES
+C_BG        = (24, 26, 34)
+C_WALL      = (70, 78, 100)
+C_WALL_HL   = (104, 114, 142)
+C_BLOCK     = (168, 104, 62)
+C_BLOCK_HL  = (208, 142, 92)
+C_FLOOR_A   = (40, 44, 56)
+C_FLOOR_B   = (46, 50, 63)
+C_PLAYER    = (86, 216, 255)
+C_PLAYER_D  = (32, 128, 178)
+C_ENEMY     = (240, 82, 100)
+C_ENEMY_D   = (140, 34, 54)
+C_BOMB      = (26, 26, 32)
+C_FUSE      = (255, 190, 60)
+C_EXPLO     = (255, 224, 120)
+C_EXPLO2    = (255, 120, 30)
+C_EXIT      = (110, 255, 150)
+C_TEXT      = (232, 236, 246)
+C_DIM       = (150, 160, 182)
+
+# ---------------------------------------------------------------- NIVELES
+LEVELS = [
+    dict(enemies=2, speed=58, density=0.50, power=2, powerups=2),
+    dict(enemies=3, speed=76, density=0.42, power=2, powerups=3),
+    dict(enemies=4, speed=94, density=0.38, power=2, powerups=4),
+]
+
+EXIT_C, EXIT_R = COLS - 2, ROWS - 2
+EXIT_RECT = pygame.Rect(EXIT_C * TILE, EXIT_R * TILE, TILE, TILE)
+
+# ---------------------------------------------------------------- SONIDO
+AUDIO_OK = True
+try:
+    pygame.mixer.init()
+except pygame.error:
+    AUDIO_OK = False
+    print("Aviso: no se pudo iniciar el audio. El juego funcionará sin sonido.")
+
+
+def make_sound(freq, duration, volume=0.3, wave="square"):
+    sample_rate = 22050
+    n = int(sample_rate * duration)
+    buf = bytearray()
+    for i in range(n):
+        t = i / sample_rate
+        env = min(1.0, i / (sample_rate * 0.01)) * (1.0 - i / n)
+        if wave == "square":
+            val = 1 if (t * freq) % 1 < 0.5 else -1
+        elif wave == "saw":
+            val = 2 * ((t * freq) % 1) - 1
+        else:
+            val = math.sin(2 * math.pi * freq * t)
+        s = int(val * volume * env * 32767)
+        s = max(-32768, min(32767, s))
+        buf += s.to_bytes(2, "little", signed=True)
+    return pygame.mixer.Sound(buffer=bytes(buf))
+
+
+def make_noise(duration, volume=0.4):
+    sample_rate = 22050
+    n = int(sample_rate * duration)
+    buf = bytearray()
+    for i in range(n):
+        env = (1.0 - i / n) ** 2
+        s = int(random.uniform(-1, 1) * volume * env * 32767)
+        s = max(-32768, min(32767, s))
+        buf += s.to_bytes(2, "little", signed=True)
+    return pygame.mixer.Sound(buffer=bytes(buf))
+
+
+def make_music_loop():
+    sample_rate = 22050
+    notes = [110, 138.6, 164.8, 138.6]
+    note_dur = 0.5
+    buf = bytearray()
+    for freq in notes:
+        n = int(sample_rate * note_dur)
+        for i in range(n):
+            t = i / sample_rate
+            env = min(1.0, i / (sample_rate * 0.05)) * (1.0 - i / n) ** 0.7
+            val = math.sin(2 * math.pi * freq * t) + 0.3 * math.sin(2 * math.pi * freq * 2 * t)
+            s = int(val * 0.15 * env * 32767)
+            s = max(-32768, min(32767, s))
+            buf += s.to_bytes(2, "little", signed=True)
+    return pygame.mixer.Sound(buffer=bytes(buf))
+
+
+if AUDIO_OK:
+    SND_BOMB    = make_sound(180, 0.08, 0.25, "square")
+    SND_EXPLODE = make_noise(0.35, 0.5)
+    SND_POWER   = make_sound(880, 0.10, 0.25, "sine")
+    SND_WIN     = make_sound(660, 0.30, 0.30, "sine")
+    SND_DEAD    = make_sound(120, 0.40, 0.35, "saw")
+    SND_MUSIC   = make_music_loop()
+
+    MASTER_VOLUME = 0.6
+    for s in (SND_BOMB, SND_EXPLODE, SND_POWER, SND_WIN, SND_DEAD):
+        s.set_volume(MASTER_VOLUME)
+    SND_MUSIC.set_volume(0.25)
+
+
+def play_sound(snd):
+    if AUDIO_OK:
+        snd.play()
+
+
+# ---------------------------------------------------------------- UTILIDADES
+def tiles_overlapping(rect):
+    c0 = max(0, rect.left // TILE)
+    c1 = min(COLS - 1, (rect.right - 1) // TILE)
+    r0 = max(0, rect.top // TILE)
+    r1 = min(ROWS - 1, (rect.bottom - 1) // TILE)
+    for r in range(r0, r1 + 1):
+        for c in range(c0, c1 + 1):
+            yield c, r
+
+
+def rect_collides(rect, grid):
+    for c, r in tiles_overlapping(rect):
+        if grid[r][c] in (1, 2):
+            return True
+    return False
+
+
+def resolve_x(rect, dx, grid):
+    if dx == 0:
+        return
+    hits = [c for c, r in tiles_overlapping(rect) if grid[r][c] in (1, 2)]
+    if not hits:
+        return
+    if dx > 0:
+        rect.right = min(hits) * TILE
+    else:
+        rect.left = (max(hits) + 1) * TILE
+
+
+def resolve_y(rect, dy, grid):
+    if dy == 0:
+        return
+    hits = [r for c, r in tiles_overlapping(rect) if grid[r][c] in (1, 2)]
+    if not hits:
+        return
+    if dy > 0:
+        rect.bottom = min(hits) * TILE
+    else:
+        rect.top = (max(hits) + 1) * TILE
+
+
+def generate_map(level_index, density):
+    """1 = muro fijo, 2 = bloque destructible, 0 = suelo."""
+    grid = [[0] * COLS for _ in range(ROWS)]
+
+    for r in range(ROWS):
+        for c in range(COLS):
+            if r == 0 or r == ROWS - 1 or c == 0 or c == COLS - 1:
+                grid[r][c] = 1
+
+    protected = {(1, 1), (2, 1), (1, 2), (1, 3), (3, 1),
+                 (EXIT_C, EXIT_R), (EXIT_C - 1, EXIT_R), (EXIT_C, EXIT_R - 1)}
+
+    # NIVEL 1: pilares clásicos
+    if level_index == 0:
+        for r in range(2, ROWS - 1, 2):
+            for c in range(2, COLS - 1, 2):
+                grid[r][c] = 1
+
+    # NIVEL 2: corredores horizontales
+    elif level_index == 1:
+        for r in range(4, ROWS - 1, 3):
+            for c in range(1, COLS - 1):
+                grid[r][c] = 1
+            for d in random.sample(range(1, COLS - 1), k=2):
+                grid[r][d] = 0
+                protected.add((d, r))
+
+    # NIVEL 3: habitaciones (cruz central)
+    else:
+        mid_r = ROWS // 2
+        mid_c = COLS // 2
+
+        for c in range(1, COLS - 1):
+            grid[mid_r][c] = 1
+        for r in range(1, ROWS - 1):
+            grid[r][mid_c] = 1
+
+        for d in random.sample(range(1, COLS - 1), k=3):
+            grid[mid_r][d] = 0
+            protected.add((d, mid_r))
+        for d in random.sample(range(1, ROWS - 1), k=3):
+            grid[d][mid_c] = 0
+            protected.add((mid_c, d))
+
+    for (c, r) in protected:
+        if 0 <= c < COLS and 0 <= r < ROWS and grid[r][c] == 1:
+            grid[r][c] = 0
+
+    for r in range(1, ROWS - 1):
+        for c in range(1, COLS - 1):
+            if grid[r][c] == 0 and (c, r) not in protected:
+                if random.random() < density:
+                    grid[r][c] = 2
+
+    return grid
+
+
+def pick_enemy_spawns(grid, n):
+    def cands(min_d):
+        out = []
+        for r in range(1, ROWS - 1):
+            for c in range(1, COLS - 1):
+                if grid[r][c] != 0:
+                    continue
+                if (c, r) == (EXIT_C, EXIT_R):
+                    continue
+                if abs(c - 1) + abs(r - 1) >= min_d:
+                    out.append((c, r))
+        return out
+
+    for min_d in (9, 7, 5, 3):
+        lst = cands(min_d)
+        if len(lst) >= n:
+            random.shuffle(lst)
+            return lst[:n]
+
+    lst = cands(1)
+    random.shuffle(lst)
+    while len(lst) < n:
+        lst.append((1, 1))
+    return lst[:n]
+
+
+# ---------------------------------------------------------------- ENTIDADES
+class Player:
+    def __init__(self, col, row):
+        self.rect = pygame.Rect(0, 0, 26, 26)
+        self.rect.center = (col * TILE + TILE // 2, row * TILE + TILE // 2)
+        self.px = float(self.rect.x)
+        self.py = float(self.rect.y)
+        self.speed = 152.0
+        self.power = 2
+        self.max_bombs = 1
+
+    def update(self, dt, grid):
+        keys = pygame.key.get_pressed()
+        dx = dy = 0.0
+        if keys[pygame.K_LEFT] or keys[pygame.K_a]:
+            dx -= 1
+        if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
+            dx += 1
+        if keys[pygame.K_UP] or keys[pygame.K_w]:
+            dy -= 1
+        if keys[pygame.K_DOWN] or keys[pygame.K_s]:
+            dy += 1
+        if dx and dy:
+            dx *= 0.7071
+            dy *= 0.7071
+
+        self.px += dx * self.speed * dt
+        self.rect.x = round(self.px)
+        resolve_x(self.rect, dx, grid)
+        self.px = float(self.rect.x)
+
+        self.py += dy * self.speed * dt
+        self.rect.y = round(self.py)
+        resolve_y(self.rect, dy, grid)
+        self.py = float(self.rect.y)
+
+    def draw(self, surf):
+        r = self.rect
+        pygame.draw.rect(surf, C_PLAYER_D, r.inflate(6, 6), border_radius=9)
+        pygame.draw.rect(surf, C_PLAYER, r, border_radius=8)
+        pygame.draw.circle(surf, (18, 44, 62), (r.centerx - 5, r.centery - 3), 3)
+        pygame.draw.circle(surf, (18, 44, 62), (r.centerx + 5, r.centery - 3), 3)
+
+
+class Enemy:
+    def __init__(self, col, row, speed):
+        self.rect = pygame.Rect(0, 0, 26, 26)
+        self.rect.center = (col * TILE + TILE // 2, row * TILE + TILE // 2)
+        self.px = float(self.rect.x)
+        self.py = float(self.rect.y)
+        self.speed = float(speed)
+        self.dir = random.choice([(1, 0), (-1, 0), (0, 1), (0, -1)])
+        self.wobble = random.random() * 6.28
+
+    def update(self, dt, grid):
+        vx, vy = self.dir
+        step = self.speed * dt
+        self.px += vx * step
+        self.py += vy * step
+        self.rect.x = round(self.px)
+        self.rect.y = round(self.py)
+
+        if rect_collides(self.rect, grid):
+            self.px -= vx * step
+            self.py -= vy * step
+            self.rect.x = round(self.px)
+            self.rect.y = round(self.py)
+            self.snap_to_center()
+            self.turn_perpendicular(grid)
+            return
+
+        if self.is_at_tile_center():
+            self.snap_to_center()
+            if random.random() < 2.0 * dt:
+                self.maybe_turn(grid)
+
+        self.wobble += dt * 8
+
+    def snap_to_center(self):
+        col = self.rect.centerx // TILE
+        row = self.rect.centery // TILE
+        self.rect.center = (col * TILE + TILE // 2, row * TILE + TILE // 2)
+        self.px = float(self.rect.x)
+        self.py = float(self.rect.y)
+
+    def is_at_tile_center(self):
+        half = TILE // 2
+        return (abs(self.rect.centerx % TILE - half) <= 2 and
+                abs(self.rect.centery % TILE - half) <= 2)
+
+    def turn_perpendicular(self, grid):
+        vx, vy = self.dir
+        perp = [(vy, vx), (-vy, -vx)]
+        random.shuffle(perp)
+        for d in perp:
+            if self.free(grid, d):
+                self.dir = d
+                return
+        rev = (-vx, -vy)
+        if self.free(grid, rev):
+            self.dir = rev
+
+    def maybe_turn(self, grid):
+        vx, vy = self.dir
+        straight_ok = self.free(grid, (vx, vy))
+        perp = [(vy, vx), (-vy, -vx)]
+        random.shuffle(perp)
+        perp_ok = [d for d in perp if self.free(grid, d)]
+
+        if not straight_ok:
+            if perp_ok:
+                self.dir = perp_ok[0]
+                return
+            rev = (-vx, -vy)
+            if self.free(grid, rev):
+                self.dir = rev
+            return
+
+        if perp_ok and random.random() < 0.3:
+            self.dir = perp_ok[0]
+
+    def free(self, grid, d):
+        probe = self.rect.move(d[0] * TILE, d[1] * TILE)
+        return not rect_collides(probe, grid)
+
+    def draw(self, surf):
+        r = self.rect
+        off = int(math.sin(self.wobble) * 1.5)
+        pygame.draw.circle(surf, C_ENEMY_D, (r.centerx, r.centery + off), 15)
+        pygame.draw.circle(surf, C_ENEMY, (r.centerx, r.centery + off), 12)
+        pygame.draw.circle(surf, (255, 255, 255), (r.centerx - 4, r.centery - 3 + off), 3)
+        pygame.draw.circle(surf, (255, 255, 255), (r.centerx + 4, r.centery - 3 + off), 3)
+        pygame.draw.circle(surf, (30, 10, 16), (r.centerx - 4, r.centery - 3 + off), 1)
+        pygame.draw.circle(surf, (30, 10, 16), (r.centerx + 4, r.centery - 3 + off), 1)
+
+
+class Bomb:
+    def __init__(self, col, row, power):
+        self.col = col
+        self.row = row
+        self.power = power
+        self.timer = 2.2
+        self.total = 2.2
+
+
+class PowerUp:
+    def __init__(self, col, row):
+        self.col = col
+        self.row = row
+        self.rect = pygame.Rect(col * TILE + 8, row * TILE + 8, TILE - 16, TILE - 16)
+        self.bob = random.random() * 6.28
+
+    def draw(self, surf):
+        self.bob += 0.08
+        offset = int(math.sin(self.bob) * 2)
+        r = self.rect.move(0, offset)
+        pygame.draw.rect(surf, (30, 70, 50), r.inflate(4, 4), border_radius=8)
+        pygame.draw.rect(surf, (110, 255, 150), r, border_radius=7)
+        cx, cy = r.center
+        pygame.draw.circle(surf, (20, 20, 26), (cx, cy + 1), 8)
+        pygame.draw.circle(surf, (255, 190, 60), (cx, cy - 8), 2)
+
+
+class Explosion:
+    def __init__(self, tiles):
+        self.tiles = tiles
+        self.timer = 0.45
+        self.total = 0.45
+
+
+# ---------------------------------------------------------------- JUEGO
+class Game:
+    def __init__(self):
+        self.state = "menu"
+        self.level_index = 0
+        self.score = 0
+        self.lives = 3
+        self.state_timer = 0.0
+        self.grid = [[0] * COLS for _ in range(ROWS)]
+        self.player = Player(1, 1)
+        self.enemies = []
+        self.bombs = []
+        self.explosions = []
+        self.powerups = []
+        self.hidden_powerups = []
+        self.exit_open = False
+        self.music_on = True
+        self.start_level(0)
+
+    def start_level(self, idx):
+        self.level_index = idx
+        cfg = LEVELS[idx]
+        self.grid = generate_map(idx, cfg["density"])
+        self.player = Player(1, 1)
+        self.player.power = cfg["power"]
+        self.player.max_bombs = 1
+        self.enemies = [Enemy(c, r, cfg["speed"])
+                        for (c, r) in pick_enemy_spawns(self.grid, cfg["enemies"])]
+        self.bombs = []
+        self.explosions = []
+        self.powerups = []
+        self.hidden_powerups = []
+
+        blocks = [(c, r) for r in range(ROWS) for c in range(COLS)
+                  if self.grid[r][c] == 2]
+        random.shuffle(blocks)
+        for (c, r) in blocks[:cfg.get("powerups", 2)]:
+            self.hidden_powerups.append((c, r))
+
+        self.exit_open = False
+        self.state = "playing"
+        self.state_timer = 0.0
+
+    def reset_run(self):
+        self.score = 0
+        self.lives = 3
+        self.start_level(0)
+
+    def handle_key(self, key):
+        if self.state == "menu":
+            self.reset_run()
+            return
+        if self.state == "playing":
+            if key == pygame.K_SPACE:
+                self.place_bomb()
+            elif key == pygame.K_m:
+                self.toggle_music()
+            elif key == pygame.K_F11:
+                self.toggle_fullscreen()
+        elif self.state in ("gameover", "win"):
+            if key in (pygame.K_r, pygame.K_RETURN, pygame.K_SPACE, pygame.K_ESCAPE):
+                self.reset_run()
+
+    def toggle_music(self):
+        if not AUDIO_OK:
+            return
+        self.music_on = not self.music_on
+        if self.music_on:
+            SND_MUSIC.play(loops=-1)
+        else:
+            SND_MUSIC.stop()
+
+    def toggle_fullscreen(self):
+        global screen, FULLSCREEN
+        FULLSCREEN = not FULLSCREEN
+        screen = create_screen(FULLSCREEN)
+        pygame.mouse.set_visible(False)
+
+    def place_bomb(self):
+        c = self.player.rect.centerx // TILE
+        r = self.player.rect.centery // TILE
+        if any(b.col == c and b.row == r for b in self.bombs):
+            return
+        if len(self.bombs) >= self.player.max_bombs:
+            return
+        play_sound(SND_BOMB)
+        self.bombs.append(Bomb(c, r, self.player.power))
+
+    def update(self, dt):
+        if self.state == "playing":
+            self.update_playing(dt)
+        elif self.state in ("dead", "clear"):
+            self.state_timer -= dt
+            if self.state_timer <= 0:
+                if self.state == "dead":
+                    if self.lives > 0:
+                        self.start_level(self.level_index)
+                    else:
+                        self.state = "gameover"
+                else:
+                    if self.level_index + 1 < len(LEVELS):
+                        self.start_level(self.level_index + 1)
+                    else:
+                        self.state = "win"
+
+    def update_playing(self, dt):
+        self.player.update(dt, self.grid)
+        for e in self.enemies:
+            e.update(dt, self.grid)
+
+        for b in self.bombs:
+            b.timer -= dt
+        for b in [b for b in self.bombs if b.timer <= 0]:
+            self.explode(b)
+
+        for ex in self.explosions:
+            ex.timer -= dt
+        self.explosions = [ex for ex in self.explosions if ex.timer > 0]
+
+        surviving = []
+        for e in self.enemies:
+            if self.explosion_hits(e.rect):
+                self.score += 50
+            else:
+                surviving.append(e)
+        self.enemies = surviving
+
+        if not self.enemies:
+            self.exit_open = True
+
+        for p in self.powerups[:]:
+            if self.player.rect.colliderect(p.rect):
+                self.player.max_bombs += 1
+                self.score += 25
+                self.powerups.remove(p)
+                play_sound(SND_POWER)
+
+        if self.explosion_hits(self.player.rect):
+            self.kill_player()
+            return
+        for e in self.enemies:
+            if self.player.rect.colliderect(e.rect):
+                self.kill_player()
+                return
+
+        if self.exit_open and self.player.rect.colliderect(EXIT_RECT):
+            self.score += 100 + self.level_index * 50
+            self.state = "clear"
+            self.state_timer = 1.4
+            play_sound(SND_WIN)
+
+    def kill_player(self):
+        self.lives -= 1
+        self.state = "dead"
+        self.state_timer = 1.3
+        play_sound(SND_DEAD)
+
+    def explode(self, bomb):
+        if bomb not in self.bombs:
+            return
+        self.bombs.remove(bomb)
+
+        tiles = [(bomb.col, bomb.row)]
+        for dc, dr in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            for i in range(1, bomb.power + 1):
+                c = bomb.col + dc * i
+                r = bomb.row + dr * i
+                if not (0 <= c < COLS and 0 <= r < ROWS):
+                    break
+                t = self.grid[r][c]
+                if t == 1:
+                    break
+                if t == 2:
+                    self.grid[r][c] = 0
+                    self.score += 10
+                    tiles.append((c, r))
+                    if (c, r) in self.hidden_powerups:
+                        self.hidden_powerups.remove((c, r))
+                        self.powerups.append(PowerUp(c, r))
+                    break
+                tiles.append((c, r))
+                for other in self.bombs:
+                    if other.col == c and other.row == r:
+                        other.timer = min(other.timer, 0.001)
+
+        play_sound(SND_EXPLODE)
+        self.explosions.append(Explosion(tiles))
+
+    def explosion_hits(self, rect):
+        for ex in self.explosions:
+            for (c, r) in ex.tiles:
+                if rect.colliderect(pygame.Rect(c * TILE, r * TILE, TILE, TILE)):
+                    return True
+        return False
+
+    def draw(self):
+        screen.fill(C_BG)
+        self.draw_map()
+        self.draw_exit()
+        self.draw_bombs()
+        self.draw_explosions()
+        for p in self.powerups:
+            p.draw(screen)
+        for e in self.enemies:
+            e.draw(screen)
+        if self.state in ("playing", "clear"):
+            self.player.draw(screen)
+        self.draw_hud()
+        self.draw_overlays()
+
+    def draw_map(self):
+        for r in range(ROWS):
+            for c in range(COLS):
+                x, y = c * TILE, r * TILE
+                t = self.grid[r][c]
+                if t == 1:
+                    pygame.draw.rect(screen, C_WALL, (x, y, TILE, TILE))
+                    pygame.draw.rect(screen, C_WALL_HL, (x + 3, y + 3, TILE - 6, 7))
+                    pygame.draw.rect(screen, (16, 18, 24), (x, y, TILE, TILE), 1)
+                elif t == 2:
+                    pygame.draw.rect(screen, (90, 56, 34),
+                                     (x + 2, y + 2, TILE - 4, TILE - 4),
+                                     border_radius=5)
+                    pygame.draw.rect(screen, C_BLOCK,
+                                     (x + 3, y + 3, TILE - 6, TILE - 6),
+                                     border_radius=4)
+                    pygame.draw.rect(screen, C_BLOCK_HL,
+                                     (x + 9, y + 9, TILE - 18, TILE - 18),
+                                     border_radius=3)
+                else:
+                    col = C_FLOOR_A if (r + c) % 2 == 0 else C_FLOOR_B
+                    pygame.draw.rect(screen, col, (x, y, TILE, TILE))
+
+    def draw_exit(self):
+        if not self.exit_open:
+            return
+        pulse = int(3 * (1 + math.sin(pygame.time.get_ticks() * 0.006)))
+        rect = EXIT_RECT.inflate(-8, -8)
+        pygame.draw.rect(screen, (30, 90, 55), rect.inflate(pulse, pulse),
+                         border_radius=8)
+        pygame.draw.rect(screen, C_EXIT, rect, border_radius=6)
+        pygame.draw.rect(screen, (230, 255, 235), rect.inflate(-14, -14),
+                         border_radius=4)
+
+    def draw_bombs(self):
+        t = pygame.time.get_ticks() * 0.02
+        for b in self.bombs:
+            cx = b.col * TILE + TILE // 2
+            cy = b.row * TILE + TILE // 2
+            frac = max(0.0, b.timer / b.total)
+            pulse = math.sin(t * (1.5 + (1 - frac) * 4)) * 2
+            radius = int(12 + pulse + (1 - frac) * 2)
+            pygame.draw.circle(screen, (60, 60, 74), (cx, cy), radius + 2)
+            pygame.draw.circle(screen, C_BOMB, (cx, cy), radius)
+            fuse = C_FUSE if int(t * 3) % 2 == 0 else (255, 90, 40)
+            pygame.draw.circle(screen, fuse, (cx, cy - radius - 3), 3)
+
+    def draw_explosions(self):
+        for ex in self.explosions:
+            k = max(0.0, ex.timer / ex.total)
+            for (c, r) in ex.tiles:
+                rect = pygame.Rect(c * TILE + 2, r * TILE + 2, TILE - 4, TILE - 4)
+                pygame.draw.rect(screen, C_EXPLO2, rect, border_radius=9)
+                inner = rect.inflate(-int(6 + 8 * k), -int(6 + 8 * k))
+                if inner.width > 2 and inner.height > 2:
+                    pygame.draw.rect(screen, C_EXPLO, inner, border_radius=7)
+
+    def draw_hud(self):
+        pygame.draw.rect(screen, (16, 18, 24), (0, PLAY_H, WIDTH, HUD_H))
+        pygame.draw.line(screen, (62, 70, 90), (0, PLAY_H), (WIDTH, PLAY_H), 2)
+
+        txt = F_SM.render(f"NIVEL {self.level_index + 1}/{len(LEVELS)}", True, C_TEXT)
+        screen.blit(txt, (16, PLAY_H + 20))
+
+        txt = F_SM.render(f"PUNTOS {self.score}", True, C_TEXT)
+        screen.blit(txt, (170, PLAY_H + 20))
+
+        txt = F_SM.render(f"ENEMIGOS {len(self.enemies)}", True,
+                          C_ENEMY if self.enemies else C_EXIT)
+        screen.blit(txt, (330, PLAY_H + 20))
+
+        txt = F_SM.render(f"VIDAS {self.lives}", True, C_PLAYER)
+        screen.blit(txt, (510, PLAY_H + 20))
+
+    def draw_overlays(self):
+        if self.state == "playing":
+            return
+        if self.state == "menu":
+            self.overlay([
+                ("BOMBIX", F_BIG, C_PLAYER),
+                ("", F_SM, C_TEXT),
+                ("Pulsa cualquier tecla para empezar", F_SM, C_TEXT),
+                ("", F_SM, C_TEXT),
+                ("Flechas / WASD  ->  moverte", F_SM, C_DIM),
+                ("ESPACIO  ->  poner bomba", F_SM, C_DIM),
+                ("M  ->  silenciar musica", F_SM, C_DIM),
+                ("F11  ->  pantalla completa", F_SM, C_DIM),
+                ("", F_SM, C_TEXT),
+                ("Rompe bloques, recoge powerups verdes", F_SM, C_DIM),
+                ("y llega a la salida verde.", F_SM, C_DIM),
+            ])
+        elif self.state == "dead":
+            self.overlay([
+                ("¡BOOM! Has caído", F_MED, C_ENEMY),
+                (f"Vidas restantes: {self.lives}", F_SM, C_TEXT),
+            ])
+        elif self.state == "clear":
+            self.overlay([
+                (f"¡Nivel {self.level_index + 1} superado!", F_MED, C_EXIT),
+                (f"Puntos: {self.score}", F_SM, C_TEXT),
+            ])
+        elif self.state == "gameover":
+            self.overlay([
+                ("GAME OVER", F_BIG, C_ENEMY),
+                (f"Puntuación final: {self.score}", F_MED, C_TEXT),
+                ("Pulsa R para volver a intentarlo", F_SM, C_DIM),
+            ])
+        elif self.state == "win":
+            self.overlay([
+                ("¡HAS GANADO!", F_BIG, C_EXIT),
+                (f"Puntuación final: {self.score}", F_MED, C_TEXT),
+                ("Eres el rey de las bombas.", F_SM, C_DIM),
+                ("Pulsa R para jugar de nuevo", F_SM, C_DIM),
+            ])
+
+    def overlay(self, lines):
+        shade = pygame.Surface((WIDTH, PLAY_H), pygame.SRCALPHA)
+        shade.fill((6, 8, 14, 190))
+        screen.blit(shade, (0, 0))
+
+        total = sum(f.render(t, True, c).get_height() + 8 for t, f, c in lines)
+        y = PLAY_H // 2 - total // 2
+        for text, font, color in lines:
+            img = font.render(text, True, color)
+            screen.blit(img, (WIDTH // 2 - img.get_width() // 2, y))
+            y += img.get_height() + 8
+
+
+# ---------------------------------------------------------------- MAIN
+def main():
+    game = Game()
+
+    if AUDIO_OK:
+        SND_MUSIC.play(loops=-1)
+
+    running = True
+    while running:
+        dt = clock.tick(60) / 1000.0
+        dt = min(dt, 0.05)
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE and game.state == "menu":
+                    running = False
+                game.handle_key(event.key)
+
+        game.update(dt)
+        game.draw()
+        pygame.display.flip()
+
+    pygame.quit()
+    sys.exit()
+
+
+if __name__ == "__main__":
+    main()
