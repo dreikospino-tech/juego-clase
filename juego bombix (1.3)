@@ -1,8 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-BOMBIX - Juego tipo bomber con 3 niveles distintos y sonido generado por código.
-Controles: Flechas/WASD para moverte, ESPACIO para bomba, M para silenciar.
-"""
 import math
 import random
 import sys
